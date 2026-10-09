@@ -52,6 +52,24 @@ std::string online_identity(const QueryRequest &request)
     return std::to_string(static_cast<int>(request.scheme)) + ":" + input;
 }
 
+// 网址 / 邮箱里常见的符号。英文输入中它们是正文的一部分，原样保留，
+// 不按中文标点上屏（"aaaa.com" 里的 "." 不能丢）。
+bool is_english_url_symbol(char character)
+{
+    switch (character)
+    {
+    case '.':
+    case '@':
+    case '-':
+    case '_':
+    case '/':
+    case ':':
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 InputSession::InputSession(SchemeType scheme_type, unsigned quanpin_autocorrect_types, bool helpcode_enabled,
@@ -214,11 +232,68 @@ KeyResult InputSession::handle_candidate_key(char character)
     return select_candidate(static_cast<std::size_t>(character - '1'));
 }
 
+// "." 在中文全拼输入中是继续英文还是中文句点：当前输入全是小写字母、
+// 且按部分拼音切分不出"拼音词"的形状（最佳切分全是单字母，如 "aaaa"），
+// 就判定为英文（"aaaa.com"）；"nihao"、"zhge"（->"zhe'ge"）走中文标点。
+bool InputSession::dot_continues_english_input() const
+{
+    if (local_input_mode_ != LocalInputMode::None || dedicated_english_mode_)
+    {
+        return false;
+    }
+    if (!has_composition() || scheme() != SchemeType::Quanpin)
+    {
+        return false;
+    }
+    const std::string &raw = engine_.get_request().raw_input;
+    if (raw.size() <= 1 ||
+        !std::all_of(raw.begin(), raw.end(), [](char letter) { return letter >= 'a' && letter <= 'z'; }))
+    {
+        return false;
+    }
+    const auto paths = quanpin::cut_pinyin_with_partial_pinyin(raw);
+    if (paths.empty())
+    {
+        return true;
+    }
+    return std::all_of(paths.front().begin(), paths.front().end(),
+                       [](const std::string &syllable) { return syllable.size() == 1; });
+}
+
 KeyResult InputSession::handle_punctuation(char character)
 {
     if (!chinese_punctuation_enabled_)
     {
         return {};
+    }
+
+    // 中文状态下输入英文时的网址符号（如 "aaaa.com" 中的 "."）：英文串里的符号
+    // 是正文的一部分，原样保留进英文输入，不按中文标点上屏，更不能丢掉。
+    if (is_english_url_symbol(character))
+    {
+        // 已经在英文临时模式里（比如刚由下面的 "." 转入）：符号直接进英文串，
+        // "www.baidu.com" 这种多个点也能连起来输。
+        if (local_input_mode_ == LocalInputMode::TemporaryEnglish && local_preedit_.size() > 1)
+        {
+            return handle_local_character(character);
+        }
+        // 专用英文模式：同理直接进英文串。
+        if (dedicated_english_mode_ && !dedicated_english_preedit_.empty())
+        {
+            dedicated_english_preedit_.push_back(character);
+            update_dedicated_english_candidates();
+            return {true, std::nullopt, std::nullopt};
+        }
+        // 全拼中文模式下，纯小写字母输入 + "." 且字母串不是拼音词形（如 "aaaa"）时，
+        // 判定为英文输入，转入英文临时模式并保留 "."；"nihao." 仍是 "你好。"。
+        if (character == '.' && dot_continues_english_input())
+        {
+            const std::string raw_letters = engine_.get_request().raw_input;
+            reset_composition();
+            local_input_mode_ = LocalInputMode::TemporaryEnglish;
+            local_preedit_ = "Y" + raw_letters + ".";
+            return {true, std::nullopt, update_local_candidates()};
+        }
     }
 
     const auto punctuation = punctuation_.translate(character);
@@ -872,7 +947,7 @@ KeyResult InputSession::handle_local_character(char character)
     if (local_input_mode_ == LocalInputMode::TemporaryEnglish)
     {
         const bool ascii_letter = (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z');
-        if (!ascii_letter)
+        if (!ascii_letter && !is_english_url_symbol(character))
         {
             return {};
         }
