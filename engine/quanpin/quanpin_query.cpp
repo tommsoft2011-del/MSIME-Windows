@@ -6,6 +6,7 @@
 #include "../shuangpin/shuangpin_utils.h"
 #include <algorithm>
 #include <climits>
+#include <functional>
 #include <map>
 #include <sqlite3.h>
 #include <stdexcept>
@@ -93,7 +94,46 @@ const CorrectionAliases &pinyin_correction_aliases()
     return kAliases;
 }
 
-std::vector<Segments> cut_one_piece_with_corrections(const std::string &pinyin)
+// 部分拼音别名：合法音节的不完整前缀（本身不是合法音节、长度 >= 2）可以当作
+// 它的完整形式来切分。"zhge" 因此能读成 "zhe"+"ge"。"zh" 这类 2 字母串在纠错表里
+// 被刻意排除（归为简拼空间），这里单独建表，不受纠错开关门控：这是输入法要兼容
+// 的"部分拼音"输入法，不是手误纠正。
+// 同一个前缀的候选按"少丢字母优先"（音节长度升序）排列，同长度按字母序，保证
+// k-best 截断时先留下最可能的读法。
+const CorrectionAliases &partial_pinyin_aliases()
+{
+    static const CorrectionAliases kAliases = [] {
+        const auto &valid_pinyin = intact_pinyin_set();
+        std::map<std::string, std::vector<std::string>> by_prefix;
+        for (const auto &syllable : intact_pinyin_list())
+        {
+            for (size_t len = 2; len < syllable.size(); ++len)
+            {
+                const std::string prefix = syllable.substr(0, len);
+                if (valid_pinyin.find(prefix) != valid_pinyin.end())
+                {
+                    continue;
+                }
+                auto &targets = by_prefix[prefix];
+                if (std::find(targets.begin(), targets.end(), syllable) == targets.end())
+                {
+                    targets.push_back(syllable);
+                }
+            }
+        }
+        CorrectionAliases aliases;
+        for (auto &[prefix, targets] : by_prefix)
+        {
+            std::stable_sort(targets.begin(), targets.end(),
+                             [](const std::string &lhs, const std::string &rhs) { return lhs.size() < rhs.size(); });
+            aliases.emplace(prefix, std::move(targets));
+        }
+        return aliases;
+    }();
+    return kAliases;
+}
+
+std::vector<Segments> cut_one_piece_with_aliases(const std::string &pinyin, const CorrectionAliases &aliases)
 {
     struct RankedPath
     {
@@ -103,7 +143,6 @@ std::vector<Segments> cut_one_piece_with_corrections(const std::string &pinyin)
     };
 
     const auto &valid_pinyin = intact_pinyin_set();
-    const auto &aliases = pinyin_correction_aliases();
     std::unordered_map<size_t, std::vector<RankedPath>> memo;
 
     const auto solve = [&](auto &&self, size_t index) -> std::vector<RankedPath> {
@@ -198,12 +237,23 @@ std::vector<Segments> cut_one_piece_with_corrections(const std::string &pinyin)
     return paths;
 }
 
-std::vector<Segments> cut_pinyin_with_corrections(const std::string &pinyin)
+std::vector<Segments> cut_one_piece_with_corrections(const std::string &pinyin)
+{
+    return cut_one_piece_with_aliases(pinyin, pinyin_correction_aliases());
+}
+
+std::vector<Segments> cut_one_piece_with_partial_pinyin(const std::string &pinyin)
+{
+    return cut_one_piece_with_aliases(pinyin, partial_pinyin_aliases());
+}
+
+std::vector<Segments> cut_pinyin_with_piece_cutter(
+    const std::string &pinyin, const std::function<std::vector<Segments>(const std::string &)> &cut_one_piece)
 {
     std::vector<Segments> merged_paths = {Segments{}};
     for (const auto &part : split(pinyin, '\''))
     {
-        const auto part_paths = cut_one_piece_with_corrections(part);
+        const auto part_paths = cut_one_piece(part);
         if (part_paths.empty())
         {
             return {};
@@ -230,6 +280,11 @@ std::vector<Segments> cut_pinyin_with_corrections(const std::string &pinyin)
         merged_paths = std::move(combined);
     }
     return merged_paths;
+}
+
+std::vector<Segments> cut_pinyin_with_corrections(const std::string &pinyin)
+{
+    return cut_pinyin_with_piece_cutter(pinyin, cut_one_piece_with_corrections);
 }
 
 std::string build_table_name_impl(const Segments &segments)
@@ -970,6 +1025,11 @@ std::vector<Segments> cut_pinyin_by_mode(const std::string &pinyin, const std::s
     }
 
     return {};
+}
+
+std::vector<Segments> cut_pinyin_with_partial_pinyin(const std::string &pinyin)
+{
+    return cut_pinyin_with_piece_cutter(pinyin, cut_one_piece_with_partial_pinyin);
 }
 
 Segments split_segments(const std::string &segmentation)

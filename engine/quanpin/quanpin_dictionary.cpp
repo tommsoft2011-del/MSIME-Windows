@@ -465,6 +465,14 @@ std::vector<WordItem> QuanpinDictionary::query_exact(const std::string &raw_inpu
         }
     }
 
+    // 部分拼音不受纠错开关门控：它是输入法承诺兼容的输入方式（"zhge" -> "zhe"+"ge"），
+    // 不是手误纠正。备选读法与主切分按词频竞争，高频词（如"这个"）会被推到前面。
+    // 对完全合法的输入，这里只产生精确切分，去重后与现有行为一致。
+    for (const auto &candidate : quanpin::cut_pinyin_with_partial_pinyin(raw_input))
+    {
+        append_alternative(candidate);
+    }
+
     if (raw_input.find('\'') == std::string::npos && segments.size() <= kMaxSyllablesForMultipleSegmentations &&
         quanpin::has_only_complete_pinyin_segments(segments))
     {
